@@ -1,0 +1,1601 @@
+
+"""
+V3.22.5g — Production Caster Collision Shape Audit
+
+Purpose
+-------
+Audit the ACTUAL production robot.py caster collision geometry.
+
+This test does NOT modify robot.py.
+This test does NOT retrain PPO.
+
+The previous diagnostics found:
+
+    Previous production caster geometry:
+        radius = 0.025 m
+        height = 0.040 m
+
+    Intended physical geometry:
+        radius = 0.040 m
+        width  = 0.025 m
+
+V3.22.5f showed that the corrected geometry removes the
+reverse-motion pitch/contact failure.
+
+V3.22.5g now audits the production implementation itself.
+
+The test performs two levels of inspection:
+
+    A. SOURCE AUDIT
+       Read robot.py and locate cylinder collision-shape
+       definitions.
+
+    B. RUNTIME AUDIT
+       Import robot.py, create the production robot, and
+       inspect the actual PyBullet collision-shape data.
+
+Expected physical caster geometry:
+
+    radius = 0.040 m
+    width  = 0.025 m
+
+Expected hierarchy:
+
+    link 0 -> base
+    link 1 -> base
+    link 2 -> base       (caster fork)
+    link 3 -> link 2     (caster wheel)
+
+Expected joint axes:
+
+    link 0 -> Y
+    link 1 -> Y
+    link 2 -> Z
+    link 3 -> Y
+
+Run:
+
+    cd C:\\python_projects\\rl_robot\\v3
+
+    python tests\\test_v3225g_production_caster_collision_audit.py
+"""
+
+import ast
+import importlib.util
+import inspect
+import math
+import os
+import sys
+from pathlib import Path
+
+import pybullet as p
+import pybullet_data
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+ROBOT_FILE = PROJECT_ROOT / "robot.py"
+
+EXPECTED_CASTER_RADIUS = 0.040
+EXPECTED_CASTER_WIDTH = 0.025
+
+CASTER_LINK_INDEX = 3
+CASTER_FORK_LINK_INDEX = 2
+
+EXPECTED_PARENT = 2
+
+EXPECTED_CASTER_AXIS = (
+    0.0,
+    1.0,
+    0.0,
+)
+
+EXPECTED_FORK_AXIS = (
+    0.0,
+    0.0,
+    1.0,
+)
+
+EXPECTED_CASTER_LOCAL_POSITION = (
+    -0.05,
+    0.0,
+    -0.04,
+)
+
+EXPECTED_CASTER_ORIENTATION_EULER = (
+    math.pi / 2.0,
+    0.0,
+    0.0,
+)
+
+EXPECTED_BASE_Z = 0.13
+
+SETTLE_STEPS = 100
+
+
+# ============================================================
+# PRINT HELPERS
+# ============================================================
+
+def print_header(title):
+    print()
+    print("=" * 80)
+    print(title)
+    print("=" * 80)
+
+
+def print_subheader(title):
+    print()
+    print("-" * 70)
+    print(title)
+    print("-" * 70)
+
+
+def fmt_vector(values):
+    return "(" + ", ".join(
+        f"{value:.9f}"
+        for value in values
+    ) + ")"
+
+
+def almost_equal(a, b, tolerance=1e-6):
+    return abs(a - b) <= tolerance
+
+
+def vector_close(a, b, tolerance=1e-6):
+    if len(a) != len(b):
+        return False
+
+    return all(
+        almost_equal(x, y, tolerance)
+        for x, y in zip(a, b)
+    )
+
+
+# ============================================================
+# SOURCE AUDIT
+# ============================================================
+
+def read_robot_source():
+    """Read robot.py without modifying it."""
+
+    if not ROBOT_FILE.exists():
+        raise FileNotFoundError(
+            f"Production robot.py was not found:\n"
+            f"{ROBOT_FILE}"
+        )
+
+    return ROBOT_FILE.read_text(
+        encoding="utf-8"
+    )
+
+
+def get_source_lines():
+    """Return robot.py source lines."""
+
+    source = read_robot_source()
+
+    return source.splitlines()
+
+
+def source_audit():
+    """
+    Inspect robot.py using Python AST.
+
+    This does not execute robot.py.
+    """
+
+    print_header(
+        "V3.22.5g — SOURCE AUDIT"
+    )
+
+    print()
+    print(
+        f"Production file:\n"
+        f"  {ROBOT_FILE}"
+    )
+
+    source = read_robot_source()
+
+    try:
+        tree = ast.parse(
+            source,
+            filename=str(ROBOT_FILE),
+        )
+    except SyntaxError as error:
+        print()
+        print("[FAIL] robot.py contains a syntax error.")
+        print(
+            f"  Line: {error.lineno}"
+        )
+        print(
+            f"  Message: {error.msg}"
+        )
+        return {
+            "syntax_ok": False,
+            "cylinder_calls": [],
+        }
+
+    print()
+    print("[PASS] robot.py syntax is valid.")
+
+    lines = get_source_lines()
+
+    cylinder_calls = []
+
+    for node in ast.walk(tree):
+
+        if not isinstance(
+            node,
+            ast.Call,
+        ):
+            continue
+
+        # ----------------------------------------------------
+        # Detect:
+        #
+        # p.createCollisionShape(...)
+        #
+        # ----------------------------------------------------
+
+        function = node.func
+
+        is_create_collision_shape = False
+
+        if isinstance(
+            function,
+            ast.Attribute,
+        ):
+            if (
+                function.attr
+                == "createCollisionShape"
+            ):
+                is_create_collision_shape = True
+
+        if not is_create_collision_shape:
+            continue
+
+        line_number = node.lineno
+
+        end_line = (
+            getattr(
+                node,
+                "end_lineno",
+                line_number,
+            )
+        )
+
+        source_fragment = "\n".join(
+            lines[
+                line_number - 1:
+                end_line
+            ]
+        )
+
+        values = {}
+
+        # ----------------------------------------------------
+        # Extract keyword values
+        # ----------------------------------------------------
+
+        for keyword in node.keywords:
+
+            if keyword.arg is None:
+                continue
+
+            value = keyword.value
+
+            if isinstance(
+                value,
+                ast.Constant,
+            ):
+                values[keyword.arg] = (
+                    value.value
+                )
+
+            elif isinstance(
+                value,
+                ast.Name,
+            ):
+                values[keyword.arg] = (
+                    value.id
+                )
+
+            elif isinstance(
+                value,
+                ast.Attribute,
+            ):
+                values[keyword.arg] = (
+                    ast.unparse(value)
+                )
+
+            else:
+                try:
+                    values[keyword.arg] = (
+                        ast.unparse(value)
+                    )
+                except Exception:
+                    values[keyword.arg] = (
+                        "<expression>"
+                    )
+
+        # ----------------------------------------------------
+        # Extract first positional argument
+        # ----------------------------------------------------
+
+        geometry_type = None
+
+        if node.args:
+
+            first_arg = node.args[0]
+
+            try:
+                geometry_type = ast.unparse(
+                    first_arg
+                )
+            except Exception:
+                geometry_type = "<expression>"
+
+        cylinder_calls.append(
+            {
+                "line": line_number,
+                "end_line": end_line,
+                "geometry_type": geometry_type,
+                "values": values,
+                "source": source_fragment,
+            }
+        )
+
+    print()
+    print(
+        f"Detected createCollisionShape calls: "
+        f"{len(cylinder_calls)}"
+    )
+
+    for index, call in enumerate(
+        cylinder_calls,
+        start=1,
+    ):
+
+        print()
+        print(
+            f"[Collision Shape {index}]"
+        )
+
+        print(
+            f"  Lines: "
+            f"{call['line']}"
+            f"-{call['end_line']}"
+        )
+
+        print(
+            f"  Geometry: "
+            f"{call['geometry_type']}"
+        )
+
+        values = call["values"]
+
+        if "radius" in values:
+            print(
+                f"  radius = "
+                f"{values['radius']}"
+            )
+
+        if "height" in values:
+            print(
+                f"  height = "
+                f"{values['height']}"
+            )
+
+        if "collisionFrameOrientation" in values:
+            print(
+                "  collisionFrameOrientation = "
+                f"{values['collisionFrameOrientation']}"
+            )
+
+        print()
+        print("  Source:")
+        print(
+            "  "
+            + call["source"].replace(
+                "\n",
+                "\n  ",
+            )
+        )
+
+    return {
+        "syntax_ok": True,
+        "cylinder_calls": cylinder_calls,
+    }
+
+
+# ============================================================
+# IMPORT PRODUCTION ROBOT
+# ============================================================
+
+def import_production_robot():
+    """
+    Import robot.py as a module.
+
+    This does not modify the source file.
+    """
+
+    print_header(
+        "RUNTIME IMPORT AUDIT"
+    )
+
+    module_name = "production_robot_v3225g"
+
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        ROBOT_FILE,
+    )
+
+    if spec is None:
+        raise ImportError(
+            "Could not create import specification "
+            f"for {ROBOT_FILE}"
+        )
+
+    if spec.loader is None:
+        raise ImportError(
+            "Production robot.py has no import loader."
+        )
+
+    module = importlib.util.module_from_spec(
+        spec
+    )
+
+    sys.modules[module_name] = module
+
+    spec.loader.exec_module(module)
+
+    print()
+    print(
+        "[PASS] robot.py imported successfully."
+    )
+
+    return module
+
+
+# ============================================================
+# PRODUCTION FUNCTION AUDIT
+# ============================================================
+
+def inspect_production_api(robot_module):
+    """Check the production robot API."""
+
+    print_header(
+        "PRODUCTION API AUDIT"
+    )
+
+    required_functions = [
+        "create_robot",
+        "stop_robot",
+        "set_wheel_velocity",
+    ]
+
+    all_present = True
+
+    for function_name in required_functions:
+
+        exists = hasattr(
+            robot_module,
+            function_name,
+        )
+
+        if exists:
+            print(
+                f"[PASS] {function_name}() found"
+            )
+        else:
+            print(
+                f"[FAIL] {function_name}() NOT found"
+            )
+            all_present = False
+
+    return all_present
+
+
+# ============================================================
+# PRODUCTION ROBOT CREATION
+# ============================================================
+
+def create_production_robot(robot_module):
+    """
+    Create the real production robot through robot.py.
+
+    No source modification occurs.
+    """
+
+    if not hasattr(
+        robot_module,
+        "create_robot",
+    ):
+        raise AttributeError(
+            "robot.py does not expose create_robot()."
+        )
+
+    robot_id = robot_module.create_robot()
+
+    print()
+    print(
+        f"[PASS] Production robot created."
+    )
+
+    print(
+        f"  PyBullet body ID = {robot_id}"
+    )
+
+    return robot_id
+
+
+# ============================================================
+# JOINT HIERARCHY AUDIT
+# ============================================================
+
+def audit_joint_hierarchy(robot_id):
+    """
+    Inspect the actual production joint hierarchy.
+    """
+
+    print_header(
+        "RUNTIME JOINT HIERARCHY AUDIT"
+    )
+
+    num_joints = p.getNumJoints(
+        robot_id
+    )
+
+    print()
+    print(
+        f"Number of joints = {num_joints}"
+    )
+
+    for joint_index in range(
+        num_joints
+    ):
+
+        info = p.getJointInfo(
+            robot_id,
+            joint_index,
+        )
+
+        joint_name = info[1].decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        joint_type = info[2]
+
+        parent_index = info[16]
+
+        axis = info[13]
+
+        local_position = info[14]
+
+        local_orientation = info[15]
+
+        print()
+        print(
+            f"Joint {joint_index}:"
+        )
+
+        print(
+            f"  Name              = "
+            f"{joint_name}"
+        )
+
+        print(
+            f"  Type              = "
+            f"{joint_type}"
+        )
+
+        print(
+            f"  Parent index      = "
+            f"{parent_index}"
+        )
+
+        print(
+            f"  Joint axis        = "
+            f"{fmt_vector(axis)}"
+        )
+
+        print(
+            f"  Local position    = "
+            f"{fmt_vector(local_position)}"
+        )
+
+        print(
+            f"  Local orientation = "
+            f"{fmt_vector(local_orientation)}"
+        )
+
+    # --------------------------------------------------------
+    # CASTER PARENT
+    # --------------------------------------------------------
+
+    if num_joints <= CASTER_LINK_INDEX:
+
+        print()
+        print(
+            "[FAIL] Production robot does not "
+            "have caster link index 3."
+        )
+
+        return False
+
+    caster_info = p.getJointInfo(
+        robot_id,
+        CASTER_LINK_INDEX,
+    )
+
+    actual_parent = caster_info[16]
+
+    actual_axis = caster_info[13]
+
+    actual_position = caster_info[14]
+
+    actual_orientation = caster_info[15]
+
+    parent_pass = (
+        actual_parent
+        == EXPECTED_PARENT
+    )
+
+    axis_pass = vector_close(
+        actual_axis,
+        EXPECTED_CASTER_AXIS,
+    )
+
+    position_pass = vector_close(
+        actual_position,
+        EXPECTED_CASTER_LOCAL_POSITION,
+    )
+
+    expected_orientation = (
+        p.getQuaternionFromEuler(
+            EXPECTED_CASTER_ORIENTATION_EULER
+        )
+    )
+
+    orientation_pass = vector_close(
+        actual_orientation,
+        expected_orientation,
+        tolerance=1e-5,
+    )
+
+    print()
+    print(
+        "CASTER LINK CHECK"
+    )
+
+    print(
+        f"  Expected parent = "
+        f"{EXPECTED_PARENT}"
+    )
+
+    print(
+        f"  Actual parent   = "
+        f"{actual_parent}"
+    )
+
+    print(
+        f"  Parent result    = "
+        f"{'PASS' if parent_pass else 'FAIL'}"
+    )
+
+    print()
+    print(
+        f"  Expected axis = "
+        f"{fmt_vector(EXPECTED_CASTER_AXIS)}"
+    )
+
+    print(
+        f"  Actual axis   = "
+        f"{fmt_vector(actual_axis)}"
+    )
+
+    print(
+        f"  Axis result   = "
+        f"{'PASS' if axis_pass else 'FAIL'}"
+    )
+
+    print()
+    print(
+        f"  Expected local position = "
+        f"{fmt_vector(EXPECTED_CASTER_LOCAL_POSITION)}"
+    )
+
+    print(
+        f"  Actual local position   = "
+        f"{fmt_vector(actual_position)}"
+    )
+
+    print(
+        f"  Position result         = "
+        f"{'PASS' if position_pass else 'FAIL'}"
+    )
+
+    print()
+    print(
+        f"  Expected orientation = "
+        f"{fmt_vector(expected_orientation)}"
+    )
+
+    print(
+        f"  Actual orientation   = "
+        f"{fmt_vector(actual_orientation)}"
+    )
+
+    print(
+        f"  Orientation result   = "
+        f"{'PASS' if orientation_pass else 'FAIL'}"
+    )
+
+    return (
+        parent_pass
+        and axis_pass
+        and position_pass
+        and orientation_pass
+    )
+
+
+# ============================================================
+# COLLISION SHAPE DATA
+# ============================================================
+
+def audit_collision_shape(
+    robot_id,
+    link_index,
+):
+    """
+    Inspect PyBullet's actual collision shape data.
+    """
+
+    print_header(
+        f"COLLISION SHAPE AUDIT — LINK {link_index}"
+    )
+
+    shape_data = p.getCollisionShapeData(
+        robot_id,
+        link_index,
+    )
+
+    if not shape_data:
+
+        print()
+        print(
+            "[FAIL] No collision shape data "
+            f"returned for link {link_index}."
+        )
+
+        return None
+
+    for index, shape in enumerate(
+        shape_data,
+        start=1,
+    ):
+
+        shape_type = shape[2]
+
+        dimensions = shape[3]
+
+        local_position = shape[5]
+
+        local_orientation = shape[6]
+
+        print()
+        print(
+            f"Collision shape {index}:"
+        )
+
+        print(
+            f"  Object ID          = "
+            f"{shape[0]}"
+        )
+
+        print(
+            f"  Link index         = "
+            f"{shape[1]}"
+        )
+
+        print(
+            f"  Shape type         = "
+            f"{shape_type}"
+        )
+
+        print(
+            f"  Dimensions         = "
+            f"{dimensions}"
+        )
+
+        print(
+            f"  Local position     = "
+            f"{local_position}"
+        )
+
+        print(
+            f"  Local orientation  = "
+            f"{local_orientation}"
+        )
+
+    return shape_data
+
+
+# ============================================================
+# CASTER CYLINDER INTERPRETATION
+# ============================================================
+
+def audit_caster_dimensions(
+    shape_data
+):
+    """
+    Compare the runtime dimensions with the intended
+    physical caster geometry.
+
+    For a PyBullet cylinder:
+
+        dimensions[0] = radius
+        dimensions[1] = height
+    """
+
+    print_header(
+        "CASTER DIMENSION CHECK"
+    )
+
+    if not shape_data:
+        return False
+
+    shape = shape_data[0]
+
+    shape_type = shape[2]
+
+    dimensions = shape[3]
+
+    print()
+    print(
+        f"Runtime shape type = {shape_type}"
+    )
+
+    print(
+        f"Runtime dimensions = {dimensions}"
+    )
+
+    if len(dimensions) < 2:
+
+        print()
+        print(
+            "[FAIL] Collision dimensions are incomplete."
+        )
+
+        return False
+
+    actual_radius = dimensions[0]
+    actual_height = dimensions[1]
+
+    print()
+    print(
+        "Expected:"
+    )
+
+    print(
+        f"  Radius = "
+        f"{EXPECTED_CASTER_RADIUS:.6f} m"
+    )
+
+    print(
+        f"  Width  = "
+        f"{EXPECTED_CASTER_WIDTH:.6f} m"
+    )
+
+    print()
+    print(
+        "Actual:"
+    )
+
+    print(
+        f"  Radius = "
+        f"{actual_radius:.6f} m"
+    )
+
+    print(
+        f"  Height = "
+        f"{actual_height:.6f} m"
+    )
+
+    radius_pass = almost_equal(
+        actual_radius,
+        EXPECTED_CASTER_RADIUS,
+        tolerance=1e-6,
+    )
+
+    width_pass = almost_equal(
+        actual_height,
+        EXPECTED_CASTER_WIDTH,
+        tolerance=1e-6,
+    )
+
+    print()
+    print(
+        f"Radius check = "
+        f"{'PASS' if radius_pass else 'FAIL'}"
+    )
+
+    print(
+        f"Width check  = "
+        f"{'PASS' if width_pass else 'FAIL'}"
+    )
+
+    if radius_pass and width_pass:
+
+        print()
+        print(
+            "[PASS] Production caster collision "
+            "dimensions match the intended geometry."
+        )
+
+    else:
+
+        print()
+        print(
+            "[FAIL] Production caster collision "
+            "dimensions do NOT match the intended geometry."
+        )
+
+    return (
+        radius_pass
+        and width_pass
+    )
+
+
+# ============================================================
+# BASE RESET / STATIC CONTACT AUDIT
+# ============================================================
+
+def audit_static_state(robot_id):
+    """
+    Let production robot settle and inspect its static state.
+    """
+
+    print_header(
+        "STATIC PRODUCTION CONTACT AUDIT"
+    )
+
+    # Stop production motors if available.
+    #
+    # The caller handles the function externally when possible.
+
+    for _ in range(
+        SETTLE_STEPS
+    ):
+        p.stepSimulation()
+
+    base_position, base_orientation = (
+        p.getBasePositionAndOrientation(
+            robot_id
+        )
+    )
+
+    base_euler = p.getEulerFromQuaternion(
+        base_orientation
+    )
+
+    pitch = math.degrees(
+        base_euler[1]
+    )
+
+    roll = math.degrees(
+        base_euler[0]
+    )
+
+    caster_contacts = p.getContactPoints(
+        bodyA=robot_id,
+        bodyB=0,
+        linkIndexA=CASTER_LINK_INDEX,
+    )
+
+    caster_force = sum(
+        contact[9]
+        for contact in caster_contacts
+    )
+
+    print()
+    print(
+        f"Base position = "
+        f"{fmt_vector(base_position)}"
+    )
+
+    print(
+        f"Base roll     = "
+        f"{roll:.6f} deg"
+    )
+
+    print(
+        f"Base pitch    = "
+        f"{pitch:.6f} deg"
+    )
+
+    print(
+        f"Caster contacts = "
+        f"{len(caster_contacts)}"
+    )
+
+    print(
+        f"Caster normal force = "
+        f"{caster_force:.6f} N"
+    )
+
+    base_height_pass = almost_equal(
+        base_position[2],
+        EXPECTED_BASE_Z,
+        tolerance=0.002,
+    )
+
+    attitude_pass = (
+        abs(roll) < 0.5
+        and abs(pitch) < 0.5
+    )
+
+    contact_pass = (
+        len(caster_contacts) > 0
+        and caster_force > 0.1
+    )
+
+    print()
+    print(
+        f"Base Z check = "
+        f"{'PASS' if base_height_pass else 'INVESTIGATE'}"
+    )
+
+    print(
+        f"Attitude check = "
+        f"{'PASS' if attitude_pass else 'INVESTIGATE'}"
+    )
+
+    print(
+        f"Caster contact check = "
+        f"{'PASS' if contact_pass else 'INVESTIGATE'}"
+    )
+
+    return (
+        base_height_pass
+        and attitude_pass
+        and contact_pass
+    )
+
+
+# ============================================================
+# SOURCE-LEVEL CASTER CANDIDATE ANALYSIS
+# ============================================================
+
+def identify_caster_candidates(
+    source_result
+):
+    """
+    Identify cylinder calls that could be the caster.
+
+    This is intentionally conservative.
+
+    We do NOT automatically modify or reinterpret robot.py.
+    """
+
+    print_header(
+        "SOURCE CASTER CANDIDATE ANALYSIS"
+    )
+
+    candidates = []
+
+    for call in source_result[
+        "cylinder_calls"
+    ]:
+
+        values = call["values"]
+
+        radius = values.get(
+            "radius"
+        )
+
+        height = values.get(
+            "height"
+        )
+
+        if radius is None or height is None:
+            continue
+
+        # Compare against known caster dimensions.
+        radius_matches_caster_width = (
+            isinstance(radius, (int, float))
+            and almost_equal(
+                float(radius),
+                EXPECTED_CASTER_WIDTH,
+                tolerance=1e-9,
+            )
+        )
+
+        height_matches_caster_radius = (
+            isinstance(height, (int, float))
+            and almost_equal(
+                float(height),
+                EXPECTED_CASTER_RADIUS,
+                tolerance=1e-9,
+            )
+        )
+
+        radius_matches_caster_radius = (
+            isinstance(radius, (int, float))
+            and almost_equal(
+                float(radius),
+                EXPECTED_CASTER_RADIUS,
+                tolerance=1e-9,
+            )
+        )
+
+        height_matches_caster_width = (
+            isinstance(height, (int, float))
+            and almost_equal(
+                float(height),
+                EXPECTED_CASTER_WHEEL_WIDTH,
+                tolerance=1e-9,
+            )
+        )
+
+        if (
+            radius_matches_caster_width
+            and height_matches_caster_radius
+        ):
+            classification = (
+                "POSSIBLE CASTER RADIUS/WIDTH SWAP"
+            )
+
+            candidates.append(
+                call
+            )
+
+        elif (
+            radius_matches_caster_radius
+            and height_matches_caster_width
+        ):
+            classification = (
+                "MATCHES INTENDED CASTER GEOMETRY"
+            )
+
+            candidates.append(
+                call
+            )
+
+        else:
+            classification = (
+                "NOT AN OBVIOUS CASTER MATCH"
+            )
+
+        print()
+        print(
+            f"Lines {call['line']}-"
+            f"{call['end_line']}: "
+            f"{classification}"
+        )
+
+        print(
+            f"  radius = {radius}"
+        )
+
+        print(
+            f"  height = {height}"
+        )
+
+    if not candidates:
+
+        print()
+        print(
+            "No obvious caster cylinder candidate "
+            "was identified automatically."
+        )
+
+    return candidates
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+def final_report(
+    source_result,
+    api_pass,
+    hierarchy_pass,
+    dimensions_pass,
+    static_pass,
+):
+    print_header(
+        "V3.22.5g — FINAL AUDIT"
+    )
+
+    source_pass = source_result[
+        "syntax_ok"
+    ]
+
+    print()
+    print(
+        f"robot.py syntax       : "
+        f"{'PASS' if source_pass else 'FAIL'}"
+    )
+
+    print(
+        f"Production API        : "
+        f"{'PASS' if api_pass else 'FAIL'}"
+    )
+
+    print(
+        f"Caster hierarchy      : "
+        f"{'PASS' if hierarchy_pass else 'INVESTIGATE'}"
+    )
+
+    print(
+        f"Caster dimensions     : "
+        f"{'PASS' if dimensions_pass else 'FAIL'}"
+    )
+
+    print(
+        f"Static production     : "
+        f"{'PASS' if static_pass else 'INVESTIGATE'}"
+    )
+
+    print()
+    print("=" * 80)
+
+    if dimensions_pass:
+
+        print(
+            "PRODUCTION GEOMETRY STATUS: MATCH"
+        )
+
+        print()
+        print(
+            "The runtime production caster collision "
+            "shape matches the intended 0.040 m radius "
+            "and 0.025 m width."
+        )
+
+        print()
+        print(
+            "Do NOT modify robot.py based on V3.22.5g."
+        )
+
+        print(
+            "Do NOT retrain PPO."
+        )
+
+    else:
+
+        print(
+            "PRODUCTION GEOMETRY STATUS: MISMATCH"
+        )
+
+        print()
+        print(
+            "The production caster collision geometry "
+            "does not match the intended physical geometry."
+        )
+
+        print()
+        print(
+            "This is consistent with the earlier "
+            "V3.22.5c/V3.22.5d forensic result."
+        )
+
+        print()
+        print(
+            "IMPORTANT:"
+        )
+
+        print(
+            "V3.22.5g is an AUDIT only."
+        )
+
+        print(
+            "Do NOT modify robot.py yet."
+        )
+
+        print(
+            "Do NOT retrain PPO."
+        )
+
+        print()
+        print(
+            "The next decision should be based on the "
+            "exact production collision-shape definition."
+        )
+
+    print("=" * 80)
+
+    print()
+    print(
+        "V3.22.5g COMPLETE"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print_header(
+        "V3.22.5g — PRODUCTION CASTER "
+        "COLLISION SHAPE AUDIT"
+    )
+
+    print()
+    print(
+        "Project root:"
+    )
+
+    print(
+        f"  {PROJECT_ROOT}"
+    )
+
+    print()
+    print(
+        "Production robot:"
+    )
+
+    print(
+        f"  {ROBOT_FILE}"
+    )
+
+    print()
+    print(
+        "Expected caster geometry:"
+    )
+
+    print(
+        f"  Radius = "
+        f"{EXPECTED_CASTER_RADIUS:.6f} m"
+    )
+
+    print(
+        f"  Width  = "
+        f"{EXPECTED_CASTER_WIDTH:.6f} m"
+    )
+
+    print()
+    print(
+        "This test WILL:"
+    )
+
+    print(
+        "  - read robot.py"
+    )
+
+    print(
+        "  - import robot.py"
+    )
+
+    print(
+        "  - create the production robot"
+    )
+
+    print(
+        "  - inspect its actual collision shape"
+    )
+
+    print(
+        "  - inspect hierarchy and joint axes"
+    )
+
+    print(
+        "  - inspect static contact"
+    )
+
+    print()
+    print(
+        "This test WILL NOT:"
+    )
+
+    print(
+        "  - modify robot.py"
+    )
+
+    print(
+        "  - save changes to the production model"
+    )
+
+    print(
+        "  - train PPO"
+    )
+
+    print(
+        "  - overwrite the existing PPO model"
+    )
+
+    # --------------------------------------------------------
+    # SOURCE AUDIT
+    # --------------------------------------------------------
+
+    source_result = source_audit()
+
+    # --------------------------------------------------------
+    # SOURCE CANDIDATES
+    # --------------------------------------------------------
+
+    identify_caster_candidates(
+        source_result
+    )
+
+    if not source_result["syntax_ok"]:
+
+        print()
+        print(
+            "[STOP] robot.py has invalid syntax."
+        )
+
+        print(
+            "Runtime audit cannot continue."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # IMPORT
+    # --------------------------------------------------------
+
+    robot_module = import_production_robot()
+
+    # --------------------------------------------------------
+    # API
+    # --------------------------------------------------------
+
+    api_pass = inspect_production_api(
+        robot_module
+    )
+
+    if not api_pass:
+
+        print()
+        print(
+            "[STOP] Required production API "
+            "is incomplete."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CONNECT PYBULLET
+    # --------------------------------------------------------
+
+    print_header(
+        "PYBULLET RUNTIME AUDIT"
+    )
+
+    client_id = p.connect(
+        p.DIRECT
+    )
+
+    if client_id < 0:
+
+        raise RuntimeError(
+            "Could not connect to PyBullet."
+        )
+
+    print()
+    print(
+        f"[PASS] PyBullet connected."
+    )
+
+    try:
+
+        p.setAdditionalSearchPath(
+            pybullet_data.getDataPath()
+        )
+
+        p.setGravity(
+            0.0,
+            0.0,
+            -9.81,
+        )
+
+        p.setTimeStep(
+            1.0 / 240.0
+        )
+
+        p.setPhysicsEngineParameter(
+            fixedTimeStep=1.0 / 240.0,
+            numSolverIterations=100,
+        )
+
+        ground_id = p.loadURDF(
+            "plane.urdf",
+            useFixedBase=True,
+        )
+
+        print()
+        print(
+            f"Ground body ID = {ground_id}"
+        )
+
+        # ----------------------------------------------------
+        # CREATE PRODUCTION ROBOT
+        # ----------------------------------------------------
+
+        robot_id = create_production_robot(
+            robot_module
+        )
+
+        # ----------------------------------------------------
+        # PRODUCTION JOINT AUDIT
+        # ----------------------------------------------------
+
+        hierarchy_pass = audit_joint_hierarchy(
+            robot_id
+        )
+
+        # ----------------------------------------------------
+        # COLLISION SHAPE
+        # ----------------------------------------------------
+
+        caster_shape_data = audit_collision_shape(
+            robot_id,
+            CASTER_LINK_INDEX,
+        )
+
+        dimensions_pass = (
+            audit_caster_dimensions(
+                caster_shape_data
+            )
+        )
+
+        # ----------------------------------------------------
+        # STOP PRODUCTION MOTORS
+        # ----------------------------------------------------
+
+        if hasattr(
+            robot_module,
+            "stop_robot",
+        ):
+            try:
+                robot_module.stop_robot(
+                    robot_id
+                )
+            except Exception as error:
+                print()
+                print(
+                    "[WARNING] stop_robot() "
+                    f"could not be called: {error}"
+                )
+
+        # ----------------------------------------------------
+        # STATIC AUDIT
+        # ----------------------------------------------------
+
+        static_pass = audit_static_state(
+            robot_id
+        )
+
+        # ----------------------------------------------------
+        # FINAL REPORT
+        # ----------------------------------------------------
+
+        final_report(
+            source_result=source_result,
+            api_pass=api_pass,
+            hierarchy_pass=hierarchy_pass,
+            dimensions_pass=dimensions_pass,
+            static_pass=static_pass,
+        )
+
+    finally:
+
+        p.disconnect()
+
+        print()
+        print(
+            "PyBullet disconnected."
+        )
+
+
+if __name__ == "__main__":
+    main()
